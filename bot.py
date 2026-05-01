@@ -57,9 +57,15 @@ CREATE TABLE IF NOT EXISTS trainings (
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS waitlist (
     user_id INTEGER,
-    training_id INTEGER
+    training_id INTEGER,
+    username TEXT
 )
 """)
+
+cursor.execute("PRAGMA table_info(waitlist)")
+waitlist_columns = [column[1] for column in cursor.fetchall()]
+if "username" not in waitlist_columns:
+    cursor.execute("ALTER TABLE waitlist ADD COLUMN username TEXT")
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS bookings (
@@ -342,15 +348,23 @@ def get_manage_bookings_kb():
     for t_id, name, date, time, _ in get_active_trainings():
         cursor.execute("SELECT COUNT(*) FROM bookings WHERE training_id=?", (t_id,))
         count = cursor.fetchone()[0]
-        if count == 0:
-            continue
+        if count > 0:
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=f"Записи: {get_training_display(name, date, time)} ({count})",
+                    callback_data=f"admin_manage_training_{t_id}"
+                )
+            ])
 
-        kb.inline_keyboard.append([
-            InlineKeyboardButton(
-                text=f"{get_training_display(name, date, time)} ({count})",
-                callback_data=f"admin_manage_training_{t_id}"
-            )
-        ])
+        cursor.execute("SELECT COUNT(*) FROM waitlist WHERE training_id=?", (t_id,))
+        wait_count = cursor.fetchone()[0]
+        if wait_count > 0:
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=f"Лист ожидания: {get_training_display(name, date, time)} ({wait_count})",
+                    callback_data=f"admin_manage_waitlist_training_{t_id}"
+                )
+            ])
 
     if not kb.inline_keyboard:
         kb.inline_keyboard.append([
@@ -381,6 +395,31 @@ def get_training_users_kb(training_id):
     ])
     return kb
 
+def get_waitlist_users_kb(training_id):
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+    cursor.execute(
+        """SELECT user_id, COALESCE(username, 'ID ' || user_id)
+           FROM waitlist
+           WHERE training_id=?
+           ORDER BY username COLLATE NOCASE, user_id""",
+        (training_id,)
+    )
+    users = cursor.fetchall()
+
+    for wait_user_id, username in users:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=username,
+                callback_data=f"admin_manage_waitlist_user_{training_id}_{wait_user_id}"
+            )
+        ])
+
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(text="⬅️ К тренировкам", callback_data="admin_manage_back")
+    ])
+    return kb
+
 def get_manage_user_action_kb(training_id, booked_user_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -395,6 +434,28 @@ def get_manage_user_action_kb(training_id, booked_user_id):
             [InlineKeyboardButton(
                 text="⬅️ К участникам",
                 callback_data=f"admin_manage_training_{training_id}"
+            )]
+        ]
+    )
+
+def get_manage_waitlist_user_action_kb(training_id, wait_user_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="✅ Записать на тренировку",
+                callback_data=f"admin_enroll_waitlist_{training_id}_{wait_user_id}"
+            )],
+            [InlineKeyboardButton(
+                text="🔁 Перенести в другой лист ожидания",
+                callback_data=f"admin_move_waitlist_{training_id}_{wait_user_id}"
+            )],
+            [InlineKeyboardButton(
+                text="❌ Удалить из листа ожидания",
+                callback_data=f"admin_remove_waitlist_{training_id}_{wait_user_id}"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ К листу ожидания",
+                callback_data=f"admin_manage_waitlist_training_{training_id}"
             )]
         ]
     )
@@ -435,6 +496,51 @@ def get_move_target_kb(from_training_id, booked_user_id):
         InlineKeyboardButton(
             text="⬅️ К действиям",
             callback_data=f"admin_manage_user_{from_training_id}_{booked_user_id}"
+        )
+    ])
+    return kb
+
+def get_waitlist_move_target_kb(from_training_id, wait_user_id):
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+    cursor.execute(
+        "SELECT COALESCE(username, 'ID ' || user_id) FROM waitlist WHERE user_id=? AND training_id=?",
+        (wait_user_id, from_training_id)
+    )
+    row = cursor.fetchone()
+    username = row[0] if row else "Участник"
+
+    for t_id, name, date, time, _ in get_active_trainings():
+        if t_id == from_training_id:
+            continue
+
+        cursor.execute("SELECT 1 FROM waitlist WHERE user_id=? AND training_id=?", (wait_user_id, t_id))
+        if cursor.fetchone():
+            continue
+
+        cursor.execute("SELECT 1 FROM bookings WHERE user_id=? AND training_id=?", (wait_user_id, t_id))
+        if cursor.fetchone():
+            continue
+
+        cursor.execute("SELECT COUNT(*) FROM waitlist WHERE training_id=?", (t_id,))
+        wait_count = cursor.fetchone()[0]
+
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"{get_training_display(name, date, time)} (ожидают: {wait_count})",
+                callback_data=f"admin_move_waitlist_to_{from_training_id}_{wait_user_id}_{t_id}"
+            )
+        ])
+
+    if not kb.inline_keyboard:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=f"Нет вариантов для {username}", callback_data="empty")
+        ])
+
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(
+            text="⬅️ К действиям",
+            callback_data=f"admin_manage_waitlist_user_{from_training_id}_{wait_user_id}"
         )
     ])
     return kb
@@ -1050,6 +1156,10 @@ async def callbacks(callback: types.CallbackQuery):
             "INSERT INTO bookings VALUES (?, ?, ?)",
             (user_id, username, t_id)
         )
+        cursor.execute(
+            "DELETE FROM waitlist WHERE user_id=? AND training_id=?",
+            (user_id, t_id)
+        )
         conn.commit()
 
         await callback.message.answer("✅ Ты записана на тренировку! 💪")
@@ -1142,9 +1252,15 @@ async def callbacks(callback: types.CallbackQuery):
             await callback.message.answer("Ты уже в списке ожидания ⏳")
             return
 
+        username = callback.from_user.username
+        if username:
+            username = "@" + username
+        else:
+            username = callback.from_user.full_name
+
         cursor.execute(
-            "INSERT INTO waitlist VALUES (?, ?)",
-            (user_id, t_id)
+            "INSERT INTO waitlist (user_id, training_id, username) VALUES (?, ?, ?)",
+            (user_id, t_id, username)
         )
         conn.commit()
 
@@ -1174,6 +1290,223 @@ async def callbacks(callback: types.CallbackQuery):
         await callback.message.answer(
             f"Участники тренировки {get_training_display(name, date, time)}:",
             reply_markup=get_training_users_kb(training_id)
+        )
+
+    elif data.startswith("admin_manage_waitlist_training_"):
+        if user_id != ADMIN_ID:
+            return
+
+        training_id = int(data.split("_")[-1])
+        cursor.execute("SELECT name, date, time FROM trainings WHERE id=?", (training_id,))
+        training = cursor.fetchone()
+        if not training:
+            await callback.message.answer("Тренировка не найдена.")
+            return
+
+        name, date, time = training
+        await callback.message.answer(
+            f"Лист ожидания тренировки {get_training_display(name, date, time)}:",
+            reply_markup=get_waitlist_users_kb(training_id)
+        )
+
+    elif data.startswith("admin_manage_waitlist_user_"):
+        if user_id != ADMIN_ID:
+            return
+
+        _, _, _, _, training_id, wait_user_id = data.split("_")
+        training_id = int(training_id)
+        wait_user_id = int(wait_user_id)
+
+        cursor.execute(
+            """SELECT COALESCE(w.username, 'ID ' || w.user_id), t.name, t.date, t.time
+               FROM waitlist w
+               JOIN trainings t ON t.id = w.training_id
+               WHERE w.training_id=? AND w.user_id=?""",
+            (training_id, wait_user_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            await callback.message.answer("Запись в листе ожидания не найдена.")
+            return
+
+        username, name, date, time = row
+        await callback.message.answer(
+            f"Что сделать с {username}?\n\nЛист ожидания: {get_training_display(name, date, time)}",
+            reply_markup=get_manage_waitlist_user_action_kb(training_id, wait_user_id)
+        )
+
+    elif data.startswith("admin_enroll_waitlist_"):
+        if user_id != ADMIN_ID:
+            return
+
+        _, _, _, training_id, wait_user_id = data.split("_")
+        training_id = int(training_id)
+        wait_user_id = int(wait_user_id)
+
+        cursor.execute(
+            """SELECT COALESCE(w.username, 'ID ' || w.user_id), t.name, t.date, t.time, t.slots
+               FROM waitlist w
+               JOIN trainings t ON t.id = w.training_id
+               WHERE w.training_id=? AND w.user_id=?""",
+            (training_id, wait_user_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            await callback.message.answer("Запись в листе ожидания не найдена.")
+            return
+
+        username, name, date, time, slots = row
+        cursor.execute("SELECT COUNT(*) FROM bookings WHERE training_id=?", (training_id,))
+        count = cursor.fetchone()[0]
+        if count >= slots:
+            await callback.message.answer("На этой тренировке пока нет свободных мест.")
+            return
+
+        cursor.execute("SELECT 1 FROM bookings WHERE user_id=? AND training_id=?", (wait_user_id, training_id))
+        if cursor.fetchone():
+            cursor.execute("DELETE FROM waitlist WHERE user_id=? AND training_id=?", (wait_user_id, training_id))
+            conn.commit()
+            await callback.message.answer("Участник уже был записан. Убрала его из листа ожидания.")
+            return
+
+        cursor.execute(
+            "INSERT INTO bookings VALUES (?, ?, ?)",
+            (wait_user_id, username, training_id)
+        )
+        cursor.execute("DELETE FROM waitlist WHERE user_id=? AND training_id=?", (wait_user_id, training_id))
+        conn.commit()
+
+        try:
+            await bot.send_message(
+                wait_user_id,
+                f"✅ Администратор записал тебя на тренировку из листа ожидания\n\n{get_training_display(name, date, time)}"
+            )
+        except:
+            pass
+
+        await callback.message.answer(f"{username} записан(а) на тренировку.")
+
+    elif data.startswith("admin_remove_waitlist_"):
+        if user_id != ADMIN_ID:
+            return
+
+        _, _, _, training_id, wait_user_id = data.split("_")
+        training_id = int(training_id)
+        wait_user_id = int(wait_user_id)
+
+        cursor.execute(
+            """SELECT COALESCE(w.username, 'ID ' || w.user_id), t.name, t.date, t.time
+               FROM waitlist w
+               JOIN trainings t ON t.id = w.training_id
+               WHERE w.training_id=? AND w.user_id=?""",
+            (training_id, wait_user_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            await callback.message.answer("Запись в листе ожидания уже отсутствует.")
+            return
+
+        username, name, date, time = row
+        cursor.execute("DELETE FROM waitlist WHERE user_id=? AND training_id=?", (wait_user_id, training_id))
+        conn.commit()
+
+        try:
+            await bot.send_message(
+                wait_user_id,
+                f"❌ Администратор удалил тебя из листа ожидания\n\n{get_training_display(name, date, time)}"
+            )
+        except:
+            pass
+
+        await callback.message.answer(f"{username} удален(а) из листа ожидания.")
+
+    elif data.startswith("admin_move_waitlist_to_"):
+        if user_id != ADMIN_ID:
+            return
+
+        _, _, _, _, from_training_id, wait_user_id, to_training_id = data.split("_")
+        from_training_id = int(from_training_id)
+        wait_user_id = int(wait_user_id)
+        to_training_id = int(to_training_id)
+
+        cursor.execute(
+            """SELECT COALESCE(w.username, 'ID ' || w.user_id), t.name, t.date, t.time
+               FROM waitlist w
+               JOIN trainings t ON t.id = w.training_id
+               WHERE w.training_id=? AND w.user_id=?""",
+            (from_training_id, wait_user_id)
+        )
+        from_row = cursor.fetchone()
+        if not from_row:
+            await callback.message.answer("Исходная запись в листе ожидания не найдена.")
+            return
+
+        username, from_name, from_date, from_time = from_row
+
+        cursor.execute("SELECT name, date, time FROM trainings WHERE id=?", (to_training_id,))
+        to_row = cursor.fetchone()
+        if not to_row:
+            await callback.message.answer("Целевая тренировка не найдена.")
+            return
+
+        to_name, to_date, to_time = to_row
+
+        cursor.execute("SELECT 1 FROM bookings WHERE user_id=? AND training_id=?", (wait_user_id, to_training_id))
+        if cursor.fetchone():
+            await callback.message.answer("Этот участник уже записан на выбранную тренировку.")
+            return
+
+        cursor.execute("SELECT 1 FROM waitlist WHERE user_id=? AND training_id=?", (wait_user_id, to_training_id))
+        if cursor.fetchone():
+            await callback.message.answer("Этот участник уже есть в листе ожидания выбранной тренировки.")
+            return
+
+        cursor.execute(
+            "UPDATE waitlist SET training_id=?, username=? WHERE user_id=? AND training_id=?",
+            (to_training_id, username, wait_user_id, from_training_id)
+        )
+        conn.commit()
+
+        try:
+            await bot.send_message(
+                wait_user_id,
+                "🔁 Администратор перенес тебя в лист ожидания другой тренировки\n\n"
+                f"Было: {get_training_display(from_name, from_date, from_time)}\n"
+                f"Стало: {get_training_display(to_name, to_date, to_time)}"
+            )
+        except:
+            pass
+
+        await callback.message.answer(
+            f"{username} перенесен(а) в другой лист ожидания.\n\n"
+            f"Было: {get_training_display(from_name, from_date, from_time)}\n"
+            f"Стало: {get_training_display(to_name, to_date, to_time)}"
+        )
+
+    elif data.startswith("admin_move_waitlist_"):
+        if user_id != ADMIN_ID:
+            return
+
+        _, _, _, training_id, wait_user_id = data.split("_")
+        training_id = int(training_id)
+        wait_user_id = int(wait_user_id)
+
+        cursor.execute(
+            """SELECT COALESCE(w.username, 'ID ' || w.user_id), t.name, t.date, t.time
+               FROM waitlist w
+               JOIN trainings t ON t.id = w.training_id
+               WHERE w.training_id=? AND w.user_id=?""",
+            (training_id, wait_user_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            await callback.message.answer("Запись в листе ожидания не найдена.")
+            return
+
+        username, name, date, time = row
+        await callback.message.answer(
+            f"Куда перенести {username}?\n\nСейчас в листе ожидания: {get_training_display(name, date, time)}",
+            reply_markup=get_waitlist_move_target_kb(training_id, wait_user_id)
         )
 
     elif data.startswith("admin_manage_user_"):
@@ -1368,4 +1701,5 @@ async def main():
 
     await dp.start_polling(bot)
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
